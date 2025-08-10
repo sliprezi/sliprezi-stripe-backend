@@ -1,36 +1,45 @@
+// server.js (CommonJS)
 const express = require("express");
 const cors = require("cors");
 const Stripe = require("stripe");
 
-// --- ENV ---
-// Set these in Render → Dashboard → your service → Environment
+// ---------- ENV ----------
 const STRIPE_SECRET_KEY = process.env.STRIPE_SECRET_KEY; // sk_live_...
-const CORS_ORIGINS = (process.env.CORS_ORIGINS || "").split(",").map(s => s.trim()).filter(Boolean);
-// e.g. "https://sliprezi-reserve-final.tiiny.site,https://sliprezi.com"
-const SUCCESS_URL = process.env.SUCCESS_URL || "https://sliprezi.com/payment-success";
-const CANCEL_URL  = process.env.CANCEL_URL  || "https://sliprezi.com/payment-cancelled";
+if (!STRIPE_SECRET_KEY) {
+  throw new Error("Missing STRIPE_SECRET_KEY");
+}
+const CORS_ORIGINS = (process.env.CORS_ORIGINS || "")
+  .split(",").map(s => s.trim()).filter(Boolean);
 
-const stripe = new Stripe(STRIPE_SECRET_KEY);
+// Where your confirm page lives
+const CONFIRM_URL_BASE = process.env.CONFIRM_URL_BASE
+  || "https://sliprezi-reserve-final.tiiny.site";
+
+// Where your profile pages live
+const PROFILE_URL_BASE = process.env.PROFILE_URL_BASE
+  || "https://sliprezi-master-final.tiiny.site";
+
+const stripe = new Stripe(STRIPE_SECRET_KEY, { apiVersion: "2024-06-20" });
 const app = express();
 
-// CORS allowlist
+// ---------- CORS ----------
 app.use(cors({
   origin(origin, cb) {
-    if (!origin) return cb(null, true); // allow same-origin / curl
+    if (!origin) return cb(null, true); // allow same-origin/curl
     if (CORS_ORIGINS.length === 0 || CORS_ORIGINS.includes(origin)) return cb(null, true);
     return cb(new Error("Not allowed by CORS: " + origin));
   }
 }));
 app.use(express.json());
 
-// Health check
+// ---------- Health ----------
 app.get("/", (req, res) => res.status(200).send("OK"));
 
-// Create Stripe Checkout Session (auth-only)
+// ---------- Create Checkout Session (auth-only) ----------
 app.post("/create-checkout-session", async (req, res) => {
   try {
     const {
-      amount_cents,           // already in cents from frontend
+      amount_cents,           // from frontend, already in cents
       currency = "usd",
       location = "",
       city = "",
@@ -38,39 +47,88 @@ app.post("/create-checkout-session", async (req, res) => {
       email = "",
       hours = "1",
       arrivalDate = "",
-      arrivalTime = ""
+      arrivalTime = "",       // 12h label
+      reservation_id = ""
     } = req.body || {};
 
-    const amount = Number.isFinite(Number(amount_cents)) ? Math.max(50, Math.floor(Number(amount_cents))) : 0;
+    // Validate amount (min $0.50 to avoid 0)
+    const amount = Number.isFinite(Number(amount_cents))
+      ? Math.max(50, Math.floor(Number(amount_cents)))
+      : 0;
     if (!amount) return res.status(400).json({ error: "Invalid amount_cents" });
 
-    const name = `Reserved Slip — ${location}${(city || state) ? ` (${[city, state].filter(Boolean).join(", ")})` : ""}`;
-    const description = `Arrival: ${arrivalDate} ${arrivalTime} • Duration: ${hours} hour(s)`;
+    const successUrl =
+      `${CONFIRM_URL_BASE}/confirm.html?session_id={CHECKOUT_SESSION_ID}` +
+      `${reservation_id ? `&reservation_id=${encodeURIComponent(reservation_id)}` : ""}` +
+      `${location ? `&location=${encodeURIComponent(location)}` : ""}`;
+
+    const cancelUrl =
+      `${PROFILE_URL_BASE}/${encodeURIComponent(location)}.html?payment=cancelled`;
 
     const session = await stripe.checkout.sessions.create({
       mode: "payment",
-      payment_intent_data: { capture_method: "manual" }, // authorize only
       customer_email: email,
+      payment_method_types: ["card"],
+      payment_intent_data: {
+        capture_method: "manual", // authorize now, capture after confirm
+        metadata: { location, city, state, hours, arrivalDate, arrivalTime, reservation_id }
+      },
       line_items: [{
+        quantity: 1,
         price_data: {
           currency,
-          product_data: { name, description },
-          unit_amount: amount // use as-is; do NOT multiply again
-        },
-        quantity: 1
+          unit_amount: amount, // already in cents
+          product_data: {
+            name: `Reserved Slip — ${location}`,
+            description: `${[city, state].filter(Boolean).join(", ")} — ${arrivalDate} ${arrivalTime} • ${hours} hour(s)`
+          }
+        }
       }],
-      metadata: { location, city, state, hours, arrivalDate, arrivalTime },
-      success_url: SUCCESS_URL,
-      cancel_url: CANCEL_URL
+      success_url: successUrl,
+      cancel_url: cancelUrl
     });
 
-    res.json({ url: session.url });
+    return res.json({ url: session.url });
   } catch (err) {
     console.error("create-checkout-session error:", err);
-    res.status(500).json({ error: err.message });
+    return res.status(500).json({ error: "create_session_failed" });
   }
 });
 
-// Listen on Render's assigned port
+// ---------- Lookup session for confirm page ----------
+app.get("/checkout-session", async (req, res) => {
+  try {
+    const { session_id } = req.query;
+    if (!session_id) return res.status(400).json({ error: "missing_session_id" });
+
+    const session = await stripe.checkout.sessions.retrieve(session_id, { expand: ["payment_intent", "customer"] });
+    const pi = session.payment_intent;
+
+    const out = {
+      id: session.id,
+      customer_email: session.customer_details?.email || session.customer_email || "",
+      amount_total: session.amount_total,      // cents
+      currency: session.currency,
+      payment_status: session.payment_status,  // may show "paid" before capture
+      pi_status: pi?.status,                   // "requires_capture" when authorized only
+      captured: pi?.charges?.data?.[0]?.captured || false,
+      authorization_last4: pi?.charges?.data?.[0]?.payment_method_details?.card?.last4 || "",
+      location: pi?.metadata?.location || "",
+      city: pi?.metadata?.city || "",
+      state: pi?.metadata?.state || "",
+      hours: pi?.metadata?.hours || "",
+      arrivalDate: pi?.metadata?.arrivalDate || "",
+      arrivalTime: pi?.metadata?.arrivalTime || "",
+      reservation_id: pi?.metadata?.reservation_id || ""
+    };
+
+    res.json(out);
+  } catch (err) {
+    console.error("checkout-session error:", err);
+    res.status(500).json({ error: "lookup_failed" });
+  }
+});
+
+// ---------- Start ----------
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`Stripe backend listening on ${PORT}`));
