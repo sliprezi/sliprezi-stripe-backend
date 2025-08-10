@@ -4,18 +4,17 @@ const cors = require("cors");
 const Stripe = require("stripe");
 
 // ---------- ENV ----------
-const STRIPE_SECRET_KEY = process.env.STRIPE_SECRET_KEY; // sk_live_...
-if (!STRIPE_SECRET_KEY) {
-  throw new Error("Missing STRIPE_SECRET_KEY");
-}
+const STRIPE_SECRET_KEY = process.env.STRIPE_SECRET_KEY; // sk_...
+if (!STRIPE_SECRET_KEY) throw new Error("Missing STRIPE_SECRET_KEY");
+
 const CORS_ORIGINS = (process.env.CORS_ORIGINS || "")
   .split(",").map(s => s.trim()).filter(Boolean);
 
-// Where your confirm page lives
-const CONFIRM_URL_BASE = process.env.CONFIRM_URL_BASE
-  || "https://sliprezi-reserve-final.tiiny.site";
+// Full URL to your confirmation page or domain root (we'll append query params)
+const CONFIRM_URL = process.env.CONFIRM_URL
+  || "https://sliprezi-reservation-confirmation.tiiny.site";
 
-// Where your profile pages live
+// Where your profile pages live (for cancel back)
 const PROFILE_URL_BASE = process.env.PROFILE_URL_BASE
   || "https://sliprezi-master-final.tiiny.site";
 
@@ -25,7 +24,7 @@ const app = express();
 // ---------- CORS ----------
 app.use(cors({
   origin(origin, cb) {
-    if (!origin) return cb(null, true); // allow same-origin/curl
+    if (!origin) return cb(null, true); // allow same-origin / curl
     if (CORS_ORIGINS.length === 0 || CORS_ORIGINS.includes(origin)) return cb(null, true);
     return cb(new Error("Not allowed by CORS: " + origin));
   }
@@ -35,11 +34,11 @@ app.use(express.json());
 // ---------- Health ----------
 app.get("/", (req, res) => res.status(200).send("OK"));
 
-// ---------- Create Checkout Session (auth-only) ----------
+// ---------- Create Checkout Session (authorize only) ----------
 app.post("/create-checkout-session", async (req, res) => {
   try {
     const {
-      amount_cents,           // from frontend, already in cents
+      amount_cents,           // already in cents from frontend
       currency = "usd",
       location = "",
       city = "",
@@ -51,33 +50,39 @@ app.post("/create-checkout-session", async (req, res) => {
       reservation_id = ""
     } = req.body || {};
 
-    // Validate amount (min $0.50 to avoid 0)
+    // Validate amount (min 50 cents)
     const amount = Number.isFinite(Number(amount_cents))
       ? Math.max(50, Math.floor(Number(amount_cents)))
       : 0;
     if (!amount) return res.status(400).json({ error: "Invalid amount_cents" });
 
-    const successUrl =
-      `${CONFIRM_URL_BASE}/confirm.html?session_id={CHECKOUT_SESSION_ID}` +
-      `${reservation_id ? `&reservation_id=${encodeURIComponent(reservation_id)}` : ""}` +
-      `${location ? `&location=${encodeURIComponent(location)}` : ""}`;
+    // Build success/cancel URLs
+    const qs = new URLSearchParams({
+      session_id: "{CHECKOUT_SESSION_ID}",
+      ...(reservation_id ? { reservation_id } : {}),
+      ...(location ? { location } : {})
+    }).toString();
 
-    const cancelUrl =
-      `${PROFILE_URL_BASE}/${encodeURIComponent(location)}.html?payment=cancelled`;
+    const successUrl = `${CONFIRM_URL}${CONFIRM_URL.includes("?") ? "&" : "?"}${qs}`;
+    const cancelUrl  = `${PROFILE_URL_BASE}/${encodeURIComponent(location)}.html?payment=cancelled`;
+
+    // Idempotency: reuse same session if same reservation_id is sent repeatedly
+    const options = reservation_id ? { idempotencyKey: `checkout_${reservation_id}` } : {};
 
     const session = await stripe.checkout.sessions.create({
       mode: "payment",
       customer_email: email,
       payment_method_types: ["card"],
+      client_reference_id: reservation_id || undefined, // nice for dashboard/search
       payment_intent_data: {
-        capture_method: "manual", // authorize now, capture after confirm
+        capture_method: "manual", // authorize now, capture after approval
         metadata: { location, city, state, hours, arrivalDate, arrivalTime, reservation_id }
       },
       line_items: [{
         quantity: 1,
         price_data: {
           currency,
-          unit_amount: amount, // already in cents
+          unit_amount: amount,
           product_data: {
             name: `Reserved Slip — ${location}`,
             description: `${[city, state].filter(Boolean).join(", ")} — ${arrivalDate} ${arrivalTime} • ${hours} hour(s)`
@@ -86,7 +91,7 @@ app.post("/create-checkout-session", async (req, res) => {
       }],
       success_url: successUrl,
       cancel_url: cancelUrl
-    });
+    }, options);
 
     return res.json({ url: session.url });
   } catch (err) {
@@ -109,8 +114,8 @@ app.get("/checkout-session", async (req, res) => {
       customer_email: session.customer_details?.email || session.customer_email || "",
       amount_total: session.amount_total,      // cents
       currency: session.currency,
-      payment_status: session.payment_status,  // may show "paid" before capture
-      pi_status: pi?.status,                   // "requires_capture" when authorized only
+      payment_status: session.payment_status,  // may show "paid" pre-capture
+      pi_status: pi?.status,                   // "requires_capture" when auth-only
       captured: pi?.charges?.data?.[0]?.captured || false,
       authorization_last4: pi?.charges?.data?.[0]?.payment_method_details?.card?.last4 || "",
       location: pi?.metadata?.location || "",
