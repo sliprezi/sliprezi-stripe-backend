@@ -19,14 +19,12 @@ const CONNECT_BUSINESS_TYPE = process.env.CONNECT_BUSINESS_TYPE || ""; // "compa
 const CONNECT_ACCOUNT_COUNTRY = process.env.CONNECT_ACCOUNT_COUNTRY || ""; // e.g. "US"
 
 // Optional platform fee (choose one or neither)
-// APPLICATION_FEE_BPS = 250 means 2.50% of the gross
 const APPLICATION_FEE_BPS   = Number(process.env.APPLICATION_FEE_BPS || 0);
-// APPLICATION_FEE_CENTS_FIXED = 99 means $0.99 fixed
 const APPLICATION_FEE_CENTS_FIXED = Number(process.env.APPLICATION_FEE_CENTS_FIXED || 0);
 
 const stripe = new Stripe(STRIPE_SECRET_KEY, { apiVersion: "2024-06-20" });
 
-// Comma-separated list of allowed origins (no trailing slashes)
+// CORS
 const parseOrigins = (s) =>
   (s || "")
     .split(",")
@@ -47,7 +45,7 @@ const app = express();
 /* --------------------------- CORS --------------------------- */
 const normalize = (o) => (o || "").replace(/\/$/, "");
 const corsOrigin = (origin, cb) => {
-  if (!origin) return cb(null, true); // same-origin / curl / server-to-server
+  if (!origin) return cb(null, true);
   const ok = ALLOW_ORIGINS.length === 0 || ALLOW_ORIGINS.includes(normalize(origin));
   return ok ? cb(null, true) : cb(new Error("Not allowed by CORS: " + origin));
 };
@@ -60,11 +58,9 @@ const corsConfig = {
 };
 
 app.use(cors(corsConfig));
-// Preflight
 app.options("*", cors(corsConfig));
 
 /* ----------------- Stripe webhook (raw body) ------------------ */
-/* Mount this BEFORE express.json(). */
 app.post(
   "/stripe-webhook",
   express.raw({ type: "application/json" }),
@@ -84,37 +80,35 @@ app.post(
 
     try {
       switch (event.type) {
+        // 🔹 New: finished Setup (we saved a card, no money moved)
         case "checkout.session.completed": {
-          // Session finished; PI exists & is authorized soon after confirmation
           const session = event.data.object;
-          const reservationId = session.client_reference_id || session?.metadata?.reservation_id || "";
-          const piId = session.payment_intent || "";
-          if (reservationId && piId) {
-            await attachPIToReservation(reservationId, piId, "requires_capture");
+          if (session.mode === "setup") {
+            const reservationId = session.client_reference_id || session?.metadata?.reservation_id || "";
+            const setupIntentId = session.setup_intent || "";
+            const customerId = session.customer || session.customer_details?.id || session.client_reference_id || "";
+            if (reservationId && setupIntentId) {
+              // Get the payment_method from the SetupIntent
+              const si = await stripe.setupIntents.retrieve(setupIntentId);
+              const pmId = si?.payment_method || "";
+              await saveSetupForReservation({
+                reservationId,
+                customerId: si?.customer || customerId || "",
+                paymentMethodId: pmId || "",
+                connectedAccountId: session?.metadata?.connected_account_id || ""
+              });
+              // Optional: mark sheet so UI can show “Card on file”
+              await setPreauthStatus(reservationId, "card_on_file");
+            }
           }
           break;
         }
-        case "payment_intent.amount_capturable_updated": {
-          // Authorization placed and capturable
-          const pi = event.data.object;
-          const reservationId = pi?.metadata?.reservation_id || "";
-          if (reservationId) {
-            // Ensure attachment (idempotent on GAS side) and mark authorized
-            await attachPIToReservation(reservationId, pi.id, "authorized");
-          }
-          break;
-        }
-        case "payment_intent.canceled": {
-          const pi = event.data.object;
-          const reservationId = pi?.metadata?.reservation_id || "";
-          if (reservationId) await setPreauthStatus(reservationId, "released");
-          break;
-        }
+
+        // 🔹 Off-session charge outcomes after approval
         case "payment_intent.succeeded": {
-          // Succeeded after capture
           const pi = event.data.object;
           const reservationId = pi?.metadata?.reservation_id || "";
-          if (reservationId) await setPreauthStatus(reservationId, "captured");
+          if (reservationId) await setPreauthStatus(reservationId, "paid");
           break;
         }
         case "payment_intent.payment_failed": {
@@ -123,13 +117,11 @@ app.post(
           if (reservationId) await setPreauthStatus(reservationId, "failed");
           break;
         }
-        default:
-          // noop
-          break;
+        default: break;
       }
     } catch (err) {
       console.error("Webhook processing error:", err);
-      // Return 200 so Stripe doesn't retry forever for non-fatal GAS hiccups
+      // 200 anyway; we don't want infinite retries for transient GAS hiccups
     }
     return res.status(200).send("ok");
   }
@@ -142,16 +134,11 @@ app.use(express.json());
 app.get("/", (req, res) => res.status(200).send("OK"));
 
 /* ----------------------- CONNECT: Get Paid ----------------------- */
-/**
- * Returns a single-use URL for onboarding (if needed) or an Express Dashboard login link.
- * Frontend usage: fetch(`/connect/get-paid?location=${encodeURIComponent(locationName)}`)
- */
 app.get("/connect/get-paid", async (req, res) => {
   try {
     const { location } = req.query;
     if (!location) return res.status(400).json({ error: "Missing location" });
 
-    // 1) Look up (or create) a connected account for this location
     let accountId = await getStripeAccountIdForLocation(location);
 
     if (!accountId) {
@@ -170,7 +157,6 @@ app.get("/connect/get-paid", async (req, res) => {
       await saveStripeAccountIdForLocation(location, accountId);
     }
 
-    // 2) If requirements incomplete → create onboarding Account Link
     const acct = await stripe.accounts.retrieve(accountId);
     const needsOnboarding =
       !acct.details_submitted ||
@@ -187,7 +173,6 @@ app.get("/connect/get-paid", async (req, res) => {
       return res.json({ url: link.url, mode: "onboarding", account_id: accountId });
     }
 
-    // 3) Otherwise → single-use Express Dashboard login link
     const login = await stripe.accounts.createLoginLink(accountId);
     return res.json({ url: login.url, mode: "login", account_id: accountId });
   } catch (e) {
@@ -196,10 +181,6 @@ app.get("/connect/get-paid", async (req, res) => {
   }
 });
 
-/**
- * Optional: always return a login link if the connected account exists
- * Frontend usage: fetch(`/connect/login?location=${encodeURIComponent(locationName)}`)
- */
 app.get("/connect/login", async (req, res) => {
   try {
     const { location } = req.query;
@@ -216,18 +197,17 @@ app.get("/connect/login", async (req, res) => {
   }
 });
 
-/* --------------- Create Stripe Checkout Session --------------- */
-/** Expects JSON:
+/* --------------- CREATE “SETUP” CHECKOUT SESSION --------------- */
+/**
+ * Front-end calls this for PAID requests (guaranteed):
  *  {
- *    amount_cents, currency?, location, city, state, email,
- *    hours, arrivalDate, arrivalTime (12h label), reservation_id?
+ *    location, city, state, email, hours, arrivalDate, arrivalTime, reservation_id
  *  }
+ * We DO NOT charge or place a hold here. We only collect & save a card (SetupIntent).
  */
 app.post("/create-checkout-session", async (req, res) => {
   try {
     const {
-      amount_cents,
-      currency = "usd",
       location = "",
       city = "",
       state = "",
@@ -238,13 +218,10 @@ app.post("/create-checkout-session", async (req, res) => {
       reservation_id = ""
     } = req.body || {};
 
-    // Validate amount (min 50 cents to avoid zero)
-    const amount = Number.isFinite(Number(amount_cents))
-      ? Math.max(50, Math.floor(Number(amount_cents)))
-      : 0;
-    if (!amount) return res.status(400).json({ error: "Invalid amount_cents" });
+    if (!email) return res.status(400).json({ error: "email_required" });
+    if (!location) return res.status(400).json({ error: "location_required" });
 
-    // Build success/cancel URLs safely
+    // Success/cancel
     const successUrlObj = new URL(CONFIRM_URL);
     successUrlObj.searchParams.set("session_id", "{CHECKOUT_SESSION_ID}");
     if (reservation_id) successUrlObj.searchParams.set("reservation_id", reservation_id);
@@ -255,83 +232,88 @@ app.post("/create-checkout-session", async (req, res) => {
     cancelUrlObj.searchParams.set("payment", "cancelled");
     const cancel_url = cancelUrlObj.toString();
 
-    // Look up connected account for this location (if any)
+    // Get Connect account for this location (if any), to store on metadata for later off-session charge
     const connectedAccountId = location ? (await getStripeAccountIdForLocation(location)) : null;
 
-    // Optional platform fee
-    const applicationFeeAmount = computeApplicationFee(amount);
+    // Find or create a platform Customer for this email
+    const customer = await findOrCreateCustomerByEmail(email);
 
-    // Idempotency to avoid duplicate sessions on double-clicks
-    const options = reservation_id ? { idempotencyKey: `checkout_${reservation_id}` } : {};
+    // Idempotency across retries
+    const options = reservation_id ? { idempotencyKey: `setup_${reservation_id}` } : {};
 
+    // ✅ Setup-mode Checkout (creates SetupIntent; no money moves)
     const session = await stripe.checkout.sessions.create({
-      mode: "payment",
-      customer_email: email || undefined,
-      client_reference_id: reservation_id || undefined, // helpful in Stripe dashboard
-      payment_method_types: ["card"],
-      // Authorize now; capture later after host approval
-      payment_intent_data: {
-        capture_method: "manual",
-        metadata: { location, city, state, hours, arrivalDate, arrivalTime, reservation_id },
-        // If a connected account exists, make this a destination charge
-        transfer_data: connectedAccountId ? { destination: connectedAccountId } : undefined,
-        application_fee_amount: connectedAccountId && applicationFeeAmount > 0 ? applicationFeeAmount : undefined,
-      },
-      line_items: [{
-        quantity: 1,
-        price_data: {
-          currency,
-          unit_amount: amount,
-          product_data: {
-            name: `Reserved Slip — ${location}`,
-            description: `${[city, state].filter(Boolean).join(", ")} — ${arrivalDate} ${arrivalTime} • ${hours} hour(s)`
-          }
-        }
-      }],
+      mode: "setup",
+      customer: customer.id,
+      customer_email: email,
+      client_reference_id: reservation_id || undefined,
       success_url,
-      cancel_url
+      cancel_url,
+      // Store context for later (webhook + /approve)
+      metadata: {
+        location, city, state, hours, arrivalDate, arrivalTime,
+        reservation_id,
+        connected_account_id: connectedAccountId || ""
+      },
+      setup_intent_data: {
+        metadata: {
+          location, city, state, hours, arrivalDate, arrivalTime,
+          reservation_id,
+          connected_account_id: connectedAccountId || ""
+        }
+      },
+      payment_method_types: ["card"]
     }, options);
 
     return res.json({ url: session.url });
   } catch (err) {
-    console.error("create-checkout-session error:", err);
-    return res.status(500).json({ error: "create_session_failed" });
+    console.error("create-checkout-session (setup) error:", err);
+    return res.status(500).json({ error: "create_setup_session_failed" });
   }
 });
 
-/* ----------------- Lookup session for confirm page ----------------- */
+/* ----------------- LOOKUP session (confirm page) ----------------- */
 app.get("/checkout-session", async (req, res) => {
   try {
     const { session_id } = req.query;
     if (!session_id) return res.status(400).json({ error: "missing_session_id" });
 
     const session = await stripe.checkout.sessions.retrieve(session_id, {
-      expand: ["payment_intent", "customer"]
+      expand: ["setup_intent", "customer"]
     });
-    const pi = session.payment_intent;
 
     const out = {
       id: session.id,
+      mode: session.mode, // "setup"
+      customer_id: session.customer || session.setup_intent?.customer || "",
       customer_email: session.customer_details?.email || session.customer_email || "",
-      amount_total: session.amount_total, // cents
-      currency: session.currency,
-      payment_status: session.payment_status, // may be "paid" before capture
-      pi_status: pi?.status,                 // "requires_capture" means auth-only
-      captured: pi?.charges?.data?.[0]?.captured || false,
-      authorization_last4: pi?.charges?.data?.[0]?.payment_method_details?.card?.last4 || "",
-      location: pi?.metadata?.location || "",
-      city: pi?.metadata?.city || "",
-      state: pi?.metadata?.state || "",
-      hours: pi?.metadata?.hours || "",
-      arrivalDate: pi?.metadata?.arrivalDate || "",
-      arrivalTime: pi?.metadata?.arrivalTime || "",
-      reservation_id: pi?.metadata?.reservation_id || session.client_reference_id || ""
+      location: session.metadata?.location || "",
+      city: session.metadata?.city || "",
+      state: session.metadata?.state || "",
+      hours: session.metadata?.hours || "",
+      arrivalDate: session.metadata?.arrivalDate || "",
+      arrivalTime: session.metadata?.arrivalTime || "",
+      reservation_id: session.metadata?.reservation_id || session.client_reference_id || "",
+      setup_intent_id: session.setup_intent || "",
+      payment_method_id: session.setup_intent && typeof session.setup_intent === "object"
+        ? session.setup_intent.payment_method
+        : undefined
     };
 
-    // Optional: attach PI to the sheet here as a backup (idempotent on GAS)
-    if (RESERVATIONS_GAS_URL && out.reservation_id && pi?.id) {
-      attachPIToReservation(out.reservation_id, pi.id, pi.status === "requires_capture" ? "authorized" : "pending")
-        .catch(err => console.warn("attachPI (from confirm) failed", err.message));
+    // Best-effort: store setup artifacts if not already (idempotent on GAS)
+    if (RESERVATIONS_GAS_URL && out.reservation_id && out.setup_intent_id) {
+      try {
+        const si = await stripe.setupIntents.retrieve(out.setup_intent_id);
+        await saveSetupForReservation({
+          reservationId: out.reservation_id,
+          customerId: si?.customer || out.customer_id || "",
+          paymentMethodId: si?.payment_method || "",
+          connectedAccountId: session?.metadata?.connected_account_id || ""
+        });
+        await setPreauthStatus(out.reservation_id, "card_on_file");
+      } catch (e) {
+        console.warn("confirm saveSetup failed:", e.message);
+      }
     }
 
     res.json(out);
@@ -341,8 +323,91 @@ app.get("/checkout-session", async (req, res) => {
   }
 });
 
-/* ---------------- Optional: capture/release helpers ---------------- */
-/** If you prefer the dashboard to call Render for capture/release instead of Apps Script */
+/* -------------------- APPROVE (charge later) -------------------- */
+/**
+ * Dashboard calls this when a location APPROVES a paid request.
+ * Body:
+ *  {
+ *    reservation_id, amount_cents, currency?, location
+ *  }
+ * Server looks up saved customer & payment_method via GAS, then charges off-session.
+ * If SCA is needed, returns { status:"action_required", url: <Checkout link> }
+ */
+app.post("/approve", async (req, res) => {
+  try {
+    const { reservation_id, amount_cents, currency = "usd", location = "" } = req.body || {};
+    if (!reservation_id) return res.status(400).json({ error: "missing reservation_id" });
+
+    const amount = Number.isFinite(Number(amount_cents))
+      ? Math.max(50, Math.floor(Number(amount_cents)))
+      : 0;
+    if (!amount) return res.status(400).json({ error: "invalid amount_cents" });
+
+    // Fetch saved artifacts from GAS
+    const payinfo = await getPaymentInfoForReservation(reservation_id);
+    if (!payinfo?.customer_id || !payinfo?.payment_method_id) {
+      return res.status(400).json({ error: "missing_customer_or_payment_method" });
+    }
+
+    const connectedAccountId = payinfo.connected_account_id || (location ? (await getStripeAccountIdForLocation(location)) : null);
+    const applicationFeeAmount = computeApplicationFee(amount);
+
+    // Create & confirm off-session charge
+    try {
+      const pi = await stripe.paymentIntents.create({
+        amount,
+        currency,
+        customer: payinfo.customer_id,
+        payment_method: payinfo.payment_method_id,
+        off_session: true,
+        confirm: true,
+        metadata: { reservation_id, location },
+        transfer_data: connectedAccountId ? { destination: connectedAccountId } : undefined,
+        application_fee_amount: connectedAccountId && applicationFeeAmount > 0 ? applicationFeeAmount : undefined,
+        statement_descriptor_suffix: "SLIPREZI",
+        on_behalf_of: connectedAccountId || undefined
+      }, {
+        idempotencyKey: `approve_${reservation_id}_${amount}`
+      });
+
+      // Success
+      await setPreauthStatus(reservation_id, "paid");
+      return res.json({ status: "succeeded", payment_intent_id: pi.id });
+    } catch (e) {
+      // SCA required or similar: fall back to hosted Checkout to finish
+      const pi = e?.payment_intent;
+      if (pi && (e.code === "authentication_required" || pi.status === "requires_action")) {
+        const successUrlObj = new URL(CONFIRM_URL);
+        successUrlObj.searchParams.set("reservation_id", reservation_id);
+        successUrlObj.searchParams.set("payment_intent_id", pi.id);
+        const success_url = successUrlObj.toString();
+
+        const cancelUrlObj = new URL(`${PROFILE_URL_BASE}/${encodeURIComponent(location || "")}.html`);
+        cancelUrlObj.searchParams.set("payment", "incomplete");
+        const cancel_url = cancelUrlObj.toString();
+
+        const session = await stripe.checkout.sessions.create({
+          mode: "payment",
+          payment_intent: pi.id,
+          success_url,
+          cancel_url
+        }, { idempotencyKey: `sca_${reservation_id}_${amount}` });
+
+        await setPreauthStatus(reservation_id, "payment_action_required");
+        return res.json({ status: "action_required", url: session.url });
+      }
+      console.error("approve charge error:", e);
+      await setPreauthStatus(reservation_id, "failed").catch(()=>{});
+      return res.status(400).json({ status: "failed", error: e.message || "charge_failed" });
+    }
+  } catch (err) {
+    console.error("POST /approve error:", err);
+    return res.status(500).json({ error: "approve_failed" });
+  }
+});
+
+/* ---------------- Optional: legacy capture/release -------------- */
+/* Kept for backwards compatibility if you still run auth+capture anywhere */
 app.post("/capture", async (req, res) => {
   try {
     const { payment_intent_id, amount_cents } = req.body || {};
@@ -352,10 +417,9 @@ app.post("/capture", async (req, res) => {
       args.amount_to_capture = Math.floor(Number(amount_cents));
     }
     const pi = await stripe.paymentIntents.capture(payment_intent_id, args);
-    // Update sheet (best-effort)
     const reservationId = pi?.metadata?.reservation_id;
     if (RESERVATIONS_GAS_URL && reservationId) {
-      setPreauthStatus(reservationId, "captured").catch(()=>{});
+      setPreauthStatus(reservationId, "paid").catch(()=>{});
     }
     return res.json({ status: "ok", payment_intent: pi.id });
   } catch (err) {
@@ -393,12 +457,8 @@ function q(obj){
 
 function computeApplicationFee(amountCents){
   let fee = 0;
-  if (APPLICATION_FEE_BPS > 0) {
-    fee += Math.floor((amountCents * APPLICATION_FEE_BPS) / 10000);
-  }
-  if (APPLICATION_FEE_CENTS_FIXED > 0) {
-    fee += APPLICATION_FEE_CENTS_FIXED;
-  }
+  if (APPLICATION_FEE_BPS > 0) fee += Math.floor((amountCents * APPLICATION_FEE_BPS) / 10000);
+  if (APPLICATION_FEE_CENTS_FIXED > 0) fee += APPLICATION_FEE_CENTS_FIXED;
   return fee;
 }
 
@@ -411,18 +471,10 @@ async function fetchJSON(url){
   catch { return null; }
 }
 
-/**
- * Look up a location's Stripe account ID via GAS.
- * GAS should handle: ?action=getacct&location=<Name>[&token=...]
- * and return JSON: { "account_id": "acct_123" } or 404/empty if none.
- */
+// Look up / save the location's Connect account
 async function getStripeAccountIdForLocation(locationName){
   if (!RESERVATIONS_GAS_URL) return null;
-  const url = `${RESERVATIONS_GAS_URL}?${q({
-    action: "getacct",
-    location: locationName,
-    token: GAS_TOKEN || undefined
-  })}`;
+  const url = `${RESERVATIONS_GAS_URL}?${q({ action: "getacct", location: locationName, token: GAS_TOKEN || undefined })}`;
   try {
     const data = await fetchJSON(url);
     const acct = data && (data.account_id || data.accountId);
@@ -432,38 +484,58 @@ async function getStripeAccountIdForLocation(locationName){
     return null;
   }
 }
-
-/**
- * Persist a location's Stripe account ID via GAS.
- * GAS should handle: ?action=setacct&location=<Name>&account_id=acct_123[&token=...]
- */
 async function saveStripeAccountIdForLocation(locationName, accountId){
   if (!RESERVATIONS_GAS_URL) return false;
-  const url = `${RESERVATIONS_GAS_URL}?${q({
-    action: "setacct",
-    location: locationName,
-    account_id: accountId,
-    token: GAS_TOKEN || undefined
-  })}`;
+  const url = `${RESERVATIONS_GAS_URL}?${q({ action: "setacct", location: locationName, account_id: accountId, token: GAS_TOKEN || undefined })}`;
   const r = await fetch(url, { method: "GET", redirect: "follow" });
   return r.ok;
 }
 
-async function attachPIToReservation(reservationId, piId, preauthStatus){
-  if (!RESERVATIONS_GAS_URL) return;
-  const url = `${RESERVATIONS_GAS_URL}?action=attachpi&${q({
+// Customers
+async function findOrCreateCustomerByEmail(email){
+  // Try to find an existing Customer by email
+  const existing = await stripe.customers.list({ email, limit: 1 });
+  if (existing.data && existing.data[0]) return existing.data[0];
+  return await stripe.customers.create({ email });
+}
+
+/** Save Setup artifacts to the reservation row via GAS.
+ * GAS should accept:
+ *  action=savesetup&reservation_id=...&customer_id=cus_...&payment_method_id=pm_...&account_id=acct_...&token=...
+ */
+async function saveSetupForReservation({ reservationId, customerId, paymentMethodId, connectedAccountId }){
+  if (!RESERVATIONS_GAS_URL || !reservationId) return;
+  const url = `${RESERVATIONS_GAS_URL}?${q({
+    action: "savesetup",
     reservation_id: reservationId,
-    payment_intent_id: piId,
-    preauth_status: preauthStatus || "requires_capture",
+    customer_id: customerId || "",
+    payment_method_id: paymentMethodId || "",
+    account_id: connectedAccountId || "",
     token: GAS_TOKEN || undefined
   })}`;
   const r = await fetch(url, { method: "GET", redirect: "follow" });
-  if (!r.ok) throw new Error(`attachPI http ${r.status}`);
+  if (!r.ok) throw new Error(`savesetup http ${r.status}`);
 }
 
+/** Fetch saved customer/payment method for a reservation.
+ * GAS should return JSON:
+ *  { customer_id: "cus_...", payment_method_id: "pm_...", connected_account_id: "acct_..." }
+ */
+async function getPaymentInfoForReservation(reservationId){
+  if (!RESERVATIONS_GAS_URL) return null;
+  const url = `${RESERVATIONS_GAS_URL}?${q({
+    action: "getpayinfo",
+    reservation_id: reservationId,
+    token: GAS_TOKEN || undefined
+  })}`;
+  return await fetchJSON(url);
+}
+
+// Status helper (reuse your existing column)
 async function setPreauthStatus(reservationId, status){
   if (!RESERVATIONS_GAS_URL) return;
-  const url = `${RESERVATIONS_GAS_URL}?action=setpreauth&${q({
+  const url = `${RESERVATIONS_GAS_URL}?${q({
+    action: "setpreauth",
     reservation_id: reservationId,
     preauth_status: status,
     token: GAS_TOKEN || undefined
