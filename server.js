@@ -12,6 +12,18 @@ const STRIPE_WEBHOOK_SECRET = process.env.STRIPE_WEBHOOK_SECRET || ""; // whsec_
 const RESERVATIONS_GAS_URL  = (process.env.RESERVATIONS_GAS_URL || "").replace(/\/$/, "");
 const GAS_TOKEN             = process.env.GAS_TOKEN || ""; // optional auth token for GAS
 
+// Connect flow + optional fees
+const CONNECT_RETURN_URL  = (process.env.CONNECT_RETURN_URL  || "https://dashboard-sliprezi-2.tiiny.site/connect/return").replace(/\/$/, "");
+const CONNECT_REFRESH_URL = (process.env.CONNECT_REFRESH_URL || "https://dashboard-sliprezi-2.tiiny.site/connect/refresh").replace(/\/$/, "");
+const CONNECT_BUSINESS_TYPE = process.env.CONNECT_BUSINESS_TYPE || ""; // "company" | "individual" | ""
+const CONNECT_ACCOUNT_COUNTRY = process.env.CONNECT_ACCOUNT_COUNTRY || ""; // e.g. "US"
+
+// Optional platform fee (choose one or neither)
+// APPLICATION_FEE_BPS = 250 means 2.50% of the gross
+const APPLICATION_FEE_BPS   = Number(process.env.APPLICATION_FEE_BPS || 0);
+// APPLICATION_FEE_CENTS_FIXED = 99 means $0.99 fixed
+const APPLICATION_FEE_CENTS_FIXED = Number(process.env.APPLICATION_FEE_CENTS_FIXED || 0);
+
 const stripe = new Stripe(STRIPE_SECRET_KEY, { apiVersion: "2024-06-20" });
 
 // Comma-separated list of allowed origins (no trailing slashes)
@@ -129,6 +141,81 @@ app.use(express.json());
 /* ------------------------- Health Check ------------------------- */
 app.get("/", (req, res) => res.status(200).send("OK"));
 
+/* ----------------------- CONNECT: Get Paid ----------------------- */
+/**
+ * Returns a single-use URL for onboarding (if needed) or an Express Dashboard login link.
+ * Frontend usage: fetch(`/connect/get-paid?location=${encodeURIComponent(locationName)}`)
+ */
+app.get("/connect/get-paid", async (req, res) => {
+  try {
+    const { location } = req.query;
+    if (!location) return res.status(400).json({ error: "Missing location" });
+
+    // 1) Look up (or create) a connected account for this location
+    let accountId = await getStripeAccountIdForLocation(location);
+
+    if (!accountId) {
+      const acctPayload = {
+        type: "express",
+        capabilities: {
+          card_payments: { requested: true },
+          transfers: { requested: true },
+        },
+      };
+      if (CONNECT_BUSINESS_TYPE) acctPayload.business_type = CONNECT_BUSINESS_TYPE;
+      if (CONNECT_ACCOUNT_COUNTRY) acctPayload.country = CONNECT_ACCOUNT_COUNTRY;
+
+      const acct = await stripe.accounts.create(acctPayload);
+      accountId = acct.id;
+      await saveStripeAccountIdForLocation(location, accountId);
+    }
+
+    // 2) If requirements incomplete → create onboarding Account Link
+    const acct = await stripe.accounts.retrieve(accountId);
+    const needsOnboarding =
+      !acct.details_submitted ||
+      (acct.requirements?.currently_due?.length ?? 0) > 0 ||
+      (acct.requirements?.past_due?.length ?? 0) > 0;
+
+    if (needsOnboarding) {
+      const link = await stripe.accountLinks.create({
+        account: accountId,
+        type: "account_onboarding",
+        refresh_url: `${CONNECT_REFRESH_URL}?location=${encodeURIComponent(location)}`,
+        return_url: `${CONNECT_RETURN_URL}?location=${encodeURIComponent(location)}`
+      });
+      return res.json({ url: link.url, mode: "onboarding", account_id: accountId });
+    }
+
+    // 3) Otherwise → single-use Express Dashboard login link
+    const login = await stripe.accounts.createLoginLink(accountId);
+    return res.json({ url: login.url, mode: "login", account_id: accountId });
+  } catch (e) {
+    console.error("GET /connect/get-paid error:", e);
+    res.status(500).json({ error: e.message || "connect_get_paid_failed" });
+  }
+});
+
+/**
+ * Optional: always return a login link if the connected account exists
+ * Frontend usage: fetch(`/connect/login?location=${encodeURIComponent(locationName)}`)
+ */
+app.get("/connect/login", async (req, res) => {
+  try {
+    const { location } = req.query;
+    if (!location) return res.status(400).json({ error: "Missing location" });
+
+    const accountId = await getStripeAccountIdForLocation(location);
+    if (!accountId) return res.status(404).json({ error: "No Stripe account for location yet" });
+
+    const login = await stripe.accounts.createLoginLink(accountId);
+    return res.json({ url: login.url, mode: "login", account_id: accountId });
+  } catch (e) {
+    console.error("GET /connect/login error:", e);
+    res.status(500).json({ error: e.message || "connect_login_failed" });
+  }
+});
+
 /* --------------- Create Stripe Checkout Session --------------- */
 /** Expects JSON:
  *  {
@@ -168,6 +255,12 @@ app.post("/create-checkout-session", async (req, res) => {
     cancelUrlObj.searchParams.set("payment", "cancelled");
     const cancel_url = cancelUrlObj.toString();
 
+    // Look up connected account for this location (if any)
+    const connectedAccountId = location ? (await getStripeAccountIdForLocation(location)) : null;
+
+    // Optional platform fee
+    const applicationFeeAmount = computeApplicationFee(amount);
+
     // Idempotency to avoid duplicate sessions on double-clicks
     const options = reservation_id ? { idempotencyKey: `checkout_${reservation_id}` } : {};
 
@@ -179,7 +272,10 @@ app.post("/create-checkout-session", async (req, res) => {
       // Authorize now; capture later after host approval
       payment_intent_data: {
         capture_method: "manual",
-        metadata: { location, city, state, hours, arrivalDate, arrivalTime, reservation_id }
+        metadata: { location, city, state, hours, arrivalDate, arrivalTime, reservation_id },
+        // If a connected account exists, make this a destination charge
+        transfer_data: connectedAccountId ? { destination: connectedAccountId } : undefined,
+        application_fee_amount: connectedAccountId && applicationFeeAmount > 0 ? applicationFeeAmount : undefined,
       },
       line_items: [{
         quantity: 1,
@@ -288,11 +384,69 @@ app.post("/release", async (req, res) => {
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`Stripe backend listening on ${PORT}`));
 
-/* ----------------------- GAS helpers ------------------------- */
+/* ----------------------- Helpers ------------------------- */
 function q(obj){
   const u = new URLSearchParams();
   Object.entries(obj).forEach(([k,v]) => { if (v !== undefined && v !== null && v !== "") u.append(k, String(v)); });
   return u.toString();
+}
+
+function computeApplicationFee(amountCents){
+  let fee = 0;
+  if (APPLICATION_FEE_BPS > 0) {
+    fee += Math.floor((amountCents * APPLICATION_FEE_BPS) / 10000);
+  }
+  if (APPLICATION_FEE_CENTS_FIXED > 0) {
+    fee += APPLICATION_FEE_CENTS_FIXED;
+  }
+  return fee;
+}
+
+async function fetchJSON(url){
+  const r = await fetch(url, { method: "GET", redirect: "follow", headers: { "Accept": "application/json" } });
+  if (r.status === 404) return null;
+  const text = await r.text();
+  if (!text) return null;
+  try { return JSON.parse(text); }
+  catch { return null; }
+}
+
+/**
+ * Look up a location's Stripe account ID via GAS.
+ * GAS should handle: ?action=getacct&location=<Name>[&token=...]
+ * and return JSON: { "account_id": "acct_123" } or 404/empty if none.
+ */
+async function getStripeAccountIdForLocation(locationName){
+  if (!RESERVATIONS_GAS_URL) return null;
+  const url = `${RESERVATIONS_GAS_URL}?${q({
+    action: "getacct",
+    location: locationName,
+    token: GAS_TOKEN || undefined
+  })}`;
+  try {
+    const data = await fetchJSON(url);
+    const acct = data && (data.account_id || data.accountId);
+    return acct && String(acct).startsWith("acct_") ? String(acct) : null;
+  } catch (e) {
+    console.warn("getStripeAccountIdForLocation failed:", e.message);
+    return null;
+  }
+}
+
+/**
+ * Persist a location's Stripe account ID via GAS.
+ * GAS should handle: ?action=setacct&location=<Name>&account_id=acct_123[&token=...]
+ */
+async function saveStripeAccountIdForLocation(locationName, accountId){
+  if (!RESERVATIONS_GAS_URL) return false;
+  const url = `${RESERVATIONS_GAS_URL}?${q({
+    action: "setacct",
+    location: locationName,
+    account_id: accountId,
+    token: GAS_TOKEN || undefined
+  })}`;
+  const r = await fetch(url, { method: "GET", redirect: "follow" });
+  return r.ok;
 }
 
 async function attachPIToReservation(reservationId, piId, preauthStatus){
@@ -314,6 +468,5 @@ async function setPreauthStatus(reservationId, status){
     preauth_status: status,
     token: GAS_TOKEN || undefined
   })}`;
-  const r = await fetch(url, { method: "GET", redirect: "follow" });
-  if (!r.ok) throw new Error(`setPreauth http ${r.status}`);
+  await fetch(url, { method: "GET", redirect: "follow" });
 }
