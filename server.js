@@ -2,7 +2,7 @@
 const express = require("express");
 const cors = require("cors");
 const Stripe = require("stripe");
-const { fetch } = require("undici");
+const fetch = globalThis.fetch; // Node 18+ has fetch built-in
 
 /* ------------------------- ENV + BASICS ------------------------- */
 const STRIPE_SECRET_KEY = process.env.STRIPE_SECRET_KEY; // sk_...
