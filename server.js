@@ -200,13 +200,6 @@ app.get("/connect/login", async (req, res) => {
 });
 
 /* --------------- CREATE “SETUP” CHECKOUT SESSION --------------- */
-/**
- * Front-end calls this for PAID requests (guaranteed):
- *  {
- *    location, city, state, email, hours, arrivalDate, arrivalTime, reservation_id, guaranteed_spend?
- *  }
- * We DO NOT charge or place a hold here. We only collect & save a card (SetupIntent).
- */
 app.post("/create-checkout-session", async (req, res) => {
   try {
     const {
@@ -217,12 +210,11 @@ app.post("/create-checkout-session", async (req, res) => {
       hours = "1",
       arrivalDate = "",
       arrivalTime = "",
-      reservation_id = "",
-      guaranteed_spend = ""   // NEW
+      reservation_id = ""
     } = req.body || {};
 
-    if (!email) return res.status(400).json({ error: "email_required" });
-    if (!location) return res.status(400).json({ error: "location_required" });
+    if (!email)     return res.status(400).json({ error: "email_required" });
+    if (!location)  return res.status(400).json({ error: "location_required" });
 
     // Success/cancel
     const successUrlObj = new URL(CONFIRM_URL);
@@ -235,36 +227,36 @@ app.post("/create-checkout-session", async (req, res) => {
     cancelUrlObj.searchParams.set("payment", "cancelled");
     const cancel_url = cancelUrlObj.toString();
 
-    // Get Connect account for this location (if any), to store on metadata for later off-session charge
+    // Connect account (if any)
     const connectedAccountId = location ? (await getStripeAccountIdForLocation(location)) : null;
 
-    // Find or create a platform Customer for this email
+    // Find or create a platform Customer for this email (sets email on the Customer object)
     const customer = await findOrCreateCustomerByEmail(email);
 
-    // Idempotency across retries
-    const options = reservation_id ? { idempotencyKey: `setup_${reservation_id}` } : {};
+    // Idempotency across retries (bump the key name if you previously sent a bad combo)
+    const options = reservation_id ? { idempotencyKey: `setup2_${reservation_id}` } : {};
 
     // ✅ Setup-mode Checkout (creates SetupIntent; no money moves)
     const session = await stripe.checkout.sessions.create({
       mode: "setup",
-      customer: customer.id,
-      customer_email: email,
+      customer: customer.id,            // <-- keep this
+      // DO NOT include customer_email when customer is set
+
       client_reference_id: reservation_id || undefined,
       success_url,
       cancel_url,
-      // Store context for later (webhook + /approve)
+
+      // Store context for later
       metadata: {
         location, city, state, hours, arrivalDate, arrivalTime,
         reservation_id,
-        connected_account_id: connectedAccountId || "",
-        guaranteed_spend: guaranteed_spend || ""
+        connected_account_id: connectedAccountId || ""
       },
       setup_intent_data: {
         metadata: {
           location, city, state, hours, arrivalDate, arrivalTime,
           reservation_id,
-          connected_account_id: connectedAccountId || "",
-          guaranteed_spend: guaranteed_spend || ""
+          connected_account_id: connectedAccountId || ""
         }
       },
       payment_method_types: ["card"]
@@ -273,9 +265,17 @@ app.post("/create-checkout-session", async (req, res) => {
     return res.json({ url: session.url });
   } catch (err) {
     console.error("create-checkout-session (setup) error:", err);
-    return res.status(500).json({ error: "create_setup_session_failed" });
+    // surface the Stripe message to the client for easier debugging
+    const status = err?.statusCode && Number.isInteger(err.statusCode) ? err.statusCode : 400;
+    return res.status(status).json({
+      error: "create_setup_session_failed",
+      stripe_message: err?.message || "",
+      stripe_code: err?.code || "",
+      stripe_param: err?.param || ""
+    });
   }
 });
+
 
 /* ----------------- LOOKUP session (confirm page) ----------------- */
 app.get("/checkout-session", async (req, res) => {
