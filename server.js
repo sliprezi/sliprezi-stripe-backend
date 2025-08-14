@@ -19,9 +19,11 @@ const CONNECT_BUSINESS_TYPE = process.env.CONNECT_BUSINESS_TYPE || ""; // "compa
 const CONNECT_ACCOUNT_COUNTRY = process.env.CONNECT_ACCOUNT_COUNTRY || ""; // e.g. "US"
 
 // Optional platform fee (choose one or neither)
+// 👉 Set these in Render → Environment Variables (e.g. APPLICATION_FEE_BPS=2000 for 20%)
 const APPLICATION_FEE_BPS   = Number(process.env.APPLICATION_FEE_BPS || 0);
 const APPLICATION_FEE_CENTS_FIXED = Number(process.env.APPLICATION_FEE_CENTS_FIXED || 0);
 
+// Optional: CORS origins
 const stripe = new Stripe(STRIPE_SECRET_KEY, { apiVersion: "2024-06-20" });
 
 // CORS
@@ -201,7 +203,7 @@ app.get("/connect/login", async (req, res) => {
 /**
  * Front-end calls this for PAID requests (guaranteed):
  *  {
- *    location, city, state, email, hours, arrivalDate, arrivalTime, reservation_id
+ *    location, city, state, email, hours, arrivalDate, arrivalTime, reservation_id, guaranteed_spend?
  *  }
  * We DO NOT charge or place a hold here. We only collect & save a card (SetupIntent).
  */
@@ -215,7 +217,8 @@ app.post("/create-checkout-session", async (req, res) => {
       hours = "1",
       arrivalDate = "",
       arrivalTime = "",
-      reservation_id = ""
+      reservation_id = "",
+      guaranteed_spend = ""   // NEW
     } = req.body || {};
 
     if (!email) return res.status(400).json({ error: "email_required" });
@@ -253,13 +256,15 @@ app.post("/create-checkout-session", async (req, res) => {
       metadata: {
         location, city, state, hours, arrivalDate, arrivalTime,
         reservation_id,
-        connected_account_id: connectedAccountId || ""
+        connected_account_id: connectedAccountId || "",
+        guaranteed_spend: guaranteed_spend || ""
       },
       setup_intent_data: {
         metadata: {
           location, city, state, hours, arrivalDate, arrivalTime,
           reservation_id,
-          connected_account_id: connectedAccountId || ""
+          connected_account_id: connectedAccountId || "",
+          guaranteed_spend: guaranteed_spend || ""
         }
       },
       payment_method_types: ["card"]
@@ -297,7 +302,8 @@ app.get("/checkout-session", async (req, res) => {
       setup_intent_id: session.setup_intent || "",
       payment_method_id: session.setup_intent && typeof session.setup_intent === "object"
         ? session.setup_intent.payment_method
-        : undefined
+        : undefined,
+      guaranteed_spend: session.metadata?.guaranteed_spend || "" // optional, for your UI if needed
     };
 
     // Best-effort: store setup artifacts if not already (idempotent on GAS)
@@ -407,7 +413,6 @@ app.post("/approve", async (req, res) => {
 });
 
 /* ---------------- Optional: legacy capture/release -------------- */
-/* Kept for backwards compatibility if you still run auth+capture anywhere */
 app.post("/capture", async (req, res) => {
   try {
     const { payment_intent_id, amount_cents } = req.body || {};
